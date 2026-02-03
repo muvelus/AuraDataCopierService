@@ -31,9 +31,10 @@ public class App {
             loadEntityKeywords(connection);
             System.out.println("Loaded " + KEYWORD_TO_ID_MAP.size() + " entity keywords.");
 
-            transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", null, "sentiment_score", "keyword");
-            transferData(connection, "x_posts", "X", "id", "text", "created_at", null, "sentiment_score", "keyword");
-            transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword");
+            transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", null, "sentiment_score", "keyword", "permalink");
+            transferData(connection, "x_posts", "X", "id", "text", "created_at", null, "sentiment_score", "keyword", "permalink");
+            transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword", "permalink");
+            transferData(connection, "reddit_posts", "Reddit", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink");
 
             System.out.println("Data consolidation complete.");
 
@@ -66,13 +67,13 @@ public class App {
 
     private static void transferData(Connection connection, String sourceTable, String platform,
                                      String idColumn, String textColumn, String dateColumn,
-                                     String authorColumn, String sentimentScoreColumn, String keywordColumn) throws SQLException {
+                                     String authorColumn, String sentimentScoreColumn, String keywordColumn, String permalinkColumn) throws SQLException {
         String selectSql = "SELECT " + idColumn + ", " + textColumn + ", " + dateColumn + ", " +
-                           (authorColumn != null ? authorColumn + ", " : "") + sentimentScoreColumn + ", " + keywordColumn +
+                           (authorColumn != null ? authorColumn + ", " : "") + sentimentScoreColumn + ", " + keywordColumn + ", " + permalinkColumn +
                            " FROM " + sourceTable;
 
-        String insertSql = "INSERT INTO mentions (managed_entity_id, platform, post_id, content, post_date, author, sentiment, sentiment_score) " +
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO NOTHING";
+        String insertSql = "INSERT INTO mentions (managed_entity_id, platform, post_id, content, post_date, author, sentiment, sentiment_score, permalink) " +
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET permalink = EXCLUDED.permalink WHERE mentions.permalink IS NULL AND EXCLUDED.permalink IS NOT NULL";
 
         try (PreparedStatement selectStmt = connection.prepareStatement(selectSql);
              ResultSet rs = selectStmt.executeQuery();
@@ -106,6 +107,7 @@ public class App {
                 insertStmt.setString(6, authorColumn != null ? rs.getString(authorColumn) : null);
                 insertStmt.setString(7, sentiment);
                 insertStmt.setInt(8, sentimentScore);
+                insertStmt.setString(9, rs.getString(permalinkColumn));
                 insertStmt.addBatch();
 
                 if (++count % BATCH_SIZE == 0) {
