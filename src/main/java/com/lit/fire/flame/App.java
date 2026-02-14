@@ -45,8 +45,15 @@ public class App {
 
     private static void loadEntityKeywords(Connection connection) throws SQLException {
         String sql = "SELECT entity_id, keyword FROM entity_keywords";
-        try (Statement stmt = connection.createStatement();
+        try (Statement stmt = connection.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
              ResultSet rs = stmt.executeQuery(sql)) {
+
+            rs.last();
+            int rowCount = rs.getRow();
+            rs.beforeFirst();
+            
+            System.out.println("Found " + rowCount + " rows in entity_keywords table.");
+
             while (rs.next()) {
                 String keyword = rs.getString("keyword");
                 long entityId = rs.getLong("entity_id");
@@ -73,13 +80,16 @@ public class App {
                            " FROM " + sourceTable;
 
         String insertSql = "INSERT INTO mentions (managed_entity_id, platform, post_id, content, post_date, author, sentiment, sentiment_score, permalink) " +
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET permalink = EXCLUDED.permalink WHERE mentions.permalink IS NULL AND EXCLUDED.permalink IS NOT NULL";
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET " +
+                           "sentiment = EXCLUDED.sentiment, " +
+                           "sentiment_score = EXCLUDED.sentiment_score, " +
+                           "permalink = CASE WHEN mentions.permalink IS NULL AND EXCLUDED.permalink IS NOT NULL THEN EXCLUDED.permalink ELSE mentions.permalink END";
 
+        int count = 0;
         try (PreparedStatement selectStmt = connection.prepareStatement(selectSql);
              ResultSet rs = selectStmt.executeQuery();
              PreparedStatement insertStmt = connection.prepareStatement(insertSql)) {
 
-            int count = 0;
             while (rs.next()) {
                 String keyword = rs.getString(keywordColumn);
                 
@@ -91,9 +101,12 @@ public class App {
 
                 int sentimentScore = rs.getInt(sentimentScoreColumn);
                 String sentiment;
+                if(sentimentScore <= 0) { // Skip if the data is not relevant to the movie
+                    continue;
+                }
                 if (sentimentScore > 80) {
                     sentiment = "POSITIVE";
-                } else if (sentimentScore < 60) {
+                } else if (sentimentScore <= 60) {
                     sentiment = "NEGATIVE";
                 } else {
                     sentiment = "NEUTRAL";
@@ -118,6 +131,7 @@ public class App {
             insertStmt.executeBatch(); // Insert remaining records
             connection.commit();
         }
+        System.out.println("Transferred " + count + " rows from " + sourceTable);
     }
 
     private static Properties loadProperties() {
