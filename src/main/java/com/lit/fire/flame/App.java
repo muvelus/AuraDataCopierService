@@ -31,10 +31,10 @@ public class App {
             loadEntityKeywords(connection);
             System.out.println("Loaded " + KEYWORD_TO_ID_MAP.size() + " entity keywords.");
 
-            transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", null, "sentiment_score", "keyword", "permalink");
-            transferData(connection, "x_posts", "X", "id", "text", "created_at", null, "sentiment_score", "keyword", "permalink");
-            transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword", "permalink");
-            transferData(connection, "reddit_posts", "Reddit", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink");
+            transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
+            transferData(connection, "x_posts", "X", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
+            transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
+            transferData(connection, "reddit_posts", "Reddit", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
 
             System.out.println("Data consolidation complete.");
 
@@ -74,25 +74,31 @@ public class App {
 
     private static void transferData(Connection connection, String sourceTable, String platform,
                                      String idColumn, String textColumn, String dateColumn,
-                                     String authorColumn, String sentimentScoreColumn, String keywordColumn, String permalinkColumn) throws SQLException {
+                                     String authorColumn, String sentimentScoreColumn, String keywordColumn, String permalinkColumn, String sentimentCategoryColumn) throws SQLException {
         String selectSql = "SELECT " + idColumn + ", " + textColumn + ", " + dateColumn + ", " +
-                           (authorColumn != null ? authorColumn + ", " : "") + sentimentScoreColumn + ", " + keywordColumn + ", " + permalinkColumn +
+                           (authorColumn != null ? authorColumn + ", " : "") + sentimentScoreColumn + ", " + keywordColumn + ", " + permalinkColumn + ", " + sentimentCategoryColumn +
                            " FROM " + sourceTable;
 
-        String insertSql = "INSERT INTO mentions (managed_entity_id, platform, post_id, content, post_date, author, sentiment, sentiment_score, permalink) " +
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET " +
+        String insertSql = "INSERT INTO mentions (managed_entity_id, platform, post_id, content, post_date, author, sentiment, sentiment_score, permalink, sentiment_category) " +
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET " +
                            "sentiment = EXCLUDED.sentiment, " +
                            "sentiment_score = EXCLUDED.sentiment_score, " +
-                           "permalink = CASE WHEN mentions.permalink IS NULL AND EXCLUDED.permalink IS NOT NULL THEN EXCLUDED.permalink ELSE mentions.permalink END";
+                           "author = COALESCE(mentions.author, EXCLUDED.author), " +
+                           "permalink = CASE WHEN mentions.permalink IS NULL AND EXCLUDED.permalink IS NOT NULL THEN EXCLUDED.permalink ELSE mentions.permalink END, " +
+                           "sentiment_category = EXCLUDED.sentiment_category";
+
+        String deleteSql = "DELETE FROM mentions WHERE post_id = ?";
 
         int count = 0;
+        int deleteCount = 0;
         try (PreparedStatement selectStmt = connection.prepareStatement(selectSql);
              ResultSet rs = selectStmt.executeQuery();
-             PreparedStatement insertStmt = connection.prepareStatement(insertSql)) {
+             PreparedStatement insertStmt = connection.prepareStatement(insertSql);
+             PreparedStatement deleteStmt = connection.prepareStatement(deleteSql)) {
 
             while (rs.next()) {
                 String keyword = rs.getString(keywordColumn);
-                
+
                 long managedEntityId = getEntityId(keyword);
 
                 if (managedEntityId == -1) { // Skip if keyword was not found
@@ -100,17 +106,25 @@ public class App {
                 }
 
                 int sentimentScore = rs.getInt(sentimentScoreColumn);
-                String sentiment;
-                if(sentimentScore <= 0) { // Skip if the data is not relevant to the movie
+                if (sentimentScore <= 0) { // Not relevant to the user — remove any existing row from the destination
+                    deleteStmt.setString(1, rs.getString(idColumn));
+                    deleteStmt.addBatch();
+                    if (++deleteCount % BATCH_SIZE == 0) {
+                        deleteStmt.executeBatch();
+                        connection.commit();
+                    }
                     continue;
                 }
-                if (sentimentScore > 80) {
+
+                String sentiment;
+                if (sentimentScore > 75) {
                     sentiment = "POSITIVE";
-                } else if (sentimentScore <= 60) {
+                } else if (sentimentScore <= 50) {
                     sentiment = "NEGATIVE";
                 } else {
                     sentiment = "NEUTRAL";
                 }
+                String sentimentCategory = rs.getString(sentimentCategoryColumn);
 
                 insertStmt.setLong(1, managedEntityId);
                 insertStmt.setString(2, platform.toUpperCase());
@@ -121,6 +135,7 @@ public class App {
                 insertStmt.setString(7, sentiment);
                 insertStmt.setInt(8, sentimentScore);
                 insertStmt.setString(9, rs.getString(permalinkColumn));
+                insertStmt.setString(10, sentimentCategory);
                 insertStmt.addBatch();
 
                 if (++count % BATCH_SIZE == 0) {
@@ -129,9 +144,10 @@ public class App {
                 }
             }
             insertStmt.executeBatch(); // Insert remaining records
+            deleteStmt.executeBatch(); // Delete remaining irrelevant records
             connection.commit();
         }
-        System.out.println("Transferred " + count + " rows from " + sourceTable);
+        System.out.println("Transferred " + count + " rows from " + sourceTable + " (removed " + deleteCount + " irrelevant rows)");
     }
 
     private static Properties loadProperties() {
