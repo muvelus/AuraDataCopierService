@@ -8,15 +8,20 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 
 public class App {
 
     private static final int BATCH_SIZE = 1000;
-    // This map will act as a cache for entity_id by keyword.
-    private static final Map<String, Long> KEYWORD_TO_ID_MAP = new HashMap<>();
+    // This map acts as a cache of entity_ids by keyword. A single keyword may map to
+    // multiple entities (e.g. a newly added entity that shares an existing keyword), so a
+    // post matching that keyword must be linked to every one of them via mention_entities.
+    private static final Map<String, List<Long>> KEYWORD_TO_IDS_MAP = new HashMap<>();
 
     public static void main(String[] args) {
         Properties props = loadProperties();
@@ -29,7 +34,7 @@ public class App {
 
             // Pre-load the keyword map from the entity_keywords table
             loadEntityKeywords(connection);
-            System.out.println("Loaded " + KEYWORD_TO_ID_MAP.size() + " entity keywords.");
+            System.out.println("Loaded " + KEYWORD_TO_IDS_MAP.size() + " entity keywords.");
 
             transferData(connection, "instagram_posts", "Instagram", "id", "text", "timestamp", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
             transferData(connection, "x_posts", "X", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
@@ -58,18 +63,17 @@ public class App {
                 String keyword = rs.getString("keyword");
                 long entityId = rs.getLong("entity_id");
                 if (keyword != null) {
-                    KEYWORD_TO_ID_MAP.put(keyword.toLowerCase(), entityId);
+                    KEYWORD_TO_IDS_MAP.computeIfAbsent(keyword.toLowerCase(), k -> new ArrayList<>()).add(entityId);
                 }
             }
         }
     }
 
-    private static long getEntityId(String keyword) {
+    private static List<Long> getEntityIds(String keyword) {
         if (keyword == null || keyword.trim().isEmpty()) {
-            return -1; // Sentinel value to indicate skipping
+            return Collections.emptyList(); // No keyword — nothing to link
         }
-        String lowerKeyword = keyword.toLowerCase();
-        return KEYWORD_TO_ID_MAP.getOrDefault(lowerKeyword, -1L);
+        return KEYWORD_TO_IDS_MAP.getOrDefault(keyword.toLowerCase(), Collections.emptyList());
     }
 
     private static void transferData(Connection connection, String sourceTable, String platform,
@@ -79,37 +83,56 @@ public class App {
                            (authorColumn != null ? authorColumn + ", " : "") + sentimentScoreColumn + ", " + keywordColumn + ", " + permalinkColumn + ", " + sentimentCategoryColumn +
                            " FROM " + sourceTable;
 
-        String insertSql = "INSERT INTO mentions (managed_entity_id, platform, post_id, content, post_date, author, sentiment, sentiment_score, permalink, sentiment_category) " +
-                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET " +
+        // Upsert the mention itself. A mention is UNIQUE on post_id, so the same post matching
+        // a second entity must reuse this row rather than insert a duplicate. RETURNING id gives
+        // us the mention's id on both insert and conflict-update, which we then link to entities.
+        String upsertSql = "INSERT INTO mentions (platform, post_id, content, post_date, author, sentiment, sentiment_score, permalink, sentiment_category) " +
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (post_id) DO UPDATE SET " +
                            "sentiment = EXCLUDED.sentiment, " +
                            "sentiment_score = EXCLUDED.sentiment_score, " +
                            "author = COALESCE(mentions.author, EXCLUDED.author), " +
                            "permalink = CASE WHEN mentions.permalink IS NULL AND EXCLUDED.permalink IS NOT NULL THEN EXCLUDED.permalink ELSE mentions.permalink END, " +
-                           "sentiment_category = EXCLUDED.sentiment_category";
+                           "sentiment_category = EXCLUDED.sentiment_category " +
+                           "RETURNING id";
 
+        // Link the mention to every entity whose keyword it matched. The join table's inverse column
+        // is managed_entity_id (see AuraService Mention#managedEntities). ON CONFLICT DO NOTHING keeps
+        // this idempotent across re-runs and when the same post matches multiple entities.
+        String linkSql = "INSERT INTO mention_entities (mention_id, managed_entity_id) VALUES (?, ?) ON CONFLICT (mention_id, managed_entity_id) DO NOTHING";
+
+        // For irrelevant posts, drop the entity links first (FK), then the mention itself.
+        String deleteLinksSql = "DELETE FROM mention_entities WHERE mention_id IN (SELECT id FROM mentions WHERE post_id = ?)";
         String deleteSql = "DELETE FROM mentions WHERE post_id = ?";
 
         int count = 0;
+        int linkCount = 0;
         int deleteCount = 0;
         try (PreparedStatement selectStmt = connection.prepareStatement(selectSql);
              ResultSet rs = selectStmt.executeQuery();
-             PreparedStatement insertStmt = connection.prepareStatement(insertSql);
+             PreparedStatement upsertStmt = connection.prepareStatement(upsertSql);
+             PreparedStatement linkStmt = connection.prepareStatement(linkSql);
+             PreparedStatement deleteLinksStmt = connection.prepareStatement(deleteLinksSql);
              PreparedStatement deleteStmt = connection.prepareStatement(deleteSql)) {
 
             while (rs.next()) {
                 String keyword = rs.getString(keywordColumn);
 
-                long managedEntityId = getEntityId(keyword);
+                List<Long> entityIds = getEntityIds(keyword);
 
-                if (managedEntityId == -1) { // Skip if keyword was not found
+                if (entityIds.isEmpty()) { // Skip if keyword matched no entity
                     continue;
                 }
 
+                String postId = rs.getString(idColumn);
+
                 int sentimentScore = rs.getInt(sentimentScoreColumn);
                 if (sentimentScore <= 0) { // Not relevant to the user — remove any existing row from the destination
-                    deleteStmt.setString(1, rs.getString(idColumn));
+                    deleteLinksStmt.setString(1, postId);
+                    deleteLinksStmt.addBatch();
+                    deleteStmt.setString(1, postId);
                     deleteStmt.addBatch();
                     if (++deleteCount % BATCH_SIZE == 0) {
+                        deleteLinksStmt.executeBatch();
                         deleteStmt.executeBatch();
                         connection.commit();
                     }
@@ -126,28 +149,41 @@ public class App {
                 }
                 String sentimentCategory = rs.getString(sentimentCategoryColumn);
 
-                insertStmt.setLong(1, managedEntityId);
-                insertStmt.setString(2, platform.toUpperCase());
-                insertStmt.setString(3, rs.getString(idColumn));
-                insertStmt.setString(4, rs.getString(textColumn));
-                insertStmt.setTimestamp(5, rs.getTimestamp(dateColumn));
-                insertStmt.setString(6, authorColumn != null ? rs.getString(authorColumn) : null);
-                insertStmt.setString(7, sentiment);
-                insertStmt.setInt(8, sentimentScore);
-                insertStmt.setString(9, rs.getString(permalinkColumn));
-                insertStmt.setString(10, sentimentCategory);
-                insertStmt.addBatch();
+                upsertStmt.setString(1, platform.toUpperCase());
+                upsertStmt.setString(2, postId);
+                upsertStmt.setString(3, rs.getString(textColumn));
+                upsertStmt.setTimestamp(4, rs.getTimestamp(dateColumn));
+                upsertStmt.setString(5, authorColumn != null ? rs.getString(authorColumn) : null);
+                upsertStmt.setString(6, sentiment);
+                upsertStmt.setInt(7, sentimentScore);
+                upsertStmt.setString(8, rs.getString(permalinkColumn));
+                upsertStmt.setString(9, sentimentCategory);
+
+                long mentionId;
+                try (ResultSet keyRs = upsertStmt.executeQuery()) {
+                    keyRs.next();
+                    mentionId = keyRs.getLong(1);
+                }
+
+                // Attach this mention to every entity that shares the matched keyword.
+                for (Long entityId : entityIds) {
+                    linkStmt.setLong(1, mentionId);
+                    linkStmt.setLong(2, entityId);
+                    linkStmt.addBatch();
+                    linkCount++;
+                }
 
                 if (++count % BATCH_SIZE == 0) {
-                    insertStmt.executeBatch();
+                    linkStmt.executeBatch();
                     connection.commit();
                 }
             }
-            insertStmt.executeBatch(); // Insert remaining records
+            linkStmt.executeBatch(); // Link remaining records
+            deleteLinksStmt.executeBatch(); // Unlink remaining irrelevant records
             deleteStmt.executeBatch(); // Delete remaining irrelevant records
             connection.commit();
         }
-        System.out.println("Transferred " + count + " rows from " + sourceTable + " (removed " + deleteCount + " irrelevant rows)");
+        System.out.println("Transferred " + count + " posts (" + linkCount + " entity links) from " + sourceTable + " (removed " + deleteCount + " irrelevant rows)");
     }
 
     private static Properties loadProperties() {
