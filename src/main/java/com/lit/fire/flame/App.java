@@ -8,12 +8,16 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class App {
 
@@ -23,16 +27,47 @@ public class App {
     // post matching that keyword must be linked to every one of them via mention_entities.
     private static final Map<String, List<Long>> KEYWORD_TO_IDS_MAP = new HashMap<>();
 
+    // How often the copy runs (data.copier.interval.minutes in application.properties, default 60).
+    // Pass "--once" to run a single copy and exit, as before.
+    private static final long DEFAULT_INTERVAL_MINUTES = 60;
+
     public static void main(String[] args) {
         Properties props = loadProperties();
+        boolean once = args.length > 0 && "--once".equals(args[0]);
+        if (once) {
+            runOnce(props);
+            return;
+        }
+        long interval = DEFAULT_INTERVAL_MINUTES;
+        try {
+            interval = Long.parseLong(props.getProperty("data.copier.interval.minutes", String.valueOf(DEFAULT_INTERVAL_MINUTES)).trim());
+        } catch (NumberFormatException ignored) {
+            // keep the default
+        }
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        // scheduleWithFixedDelay: a slow copy never overlaps the next one. Each run is wrapped so an
+        // error (e.g. the database restarting) is logged and the next run still happens.
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                runOnce(props);
+            } catch (Throwable t) {
+                System.err.println("[" + Instant.now() + "] Data copy failed: " + t);
+            }
+        }, 0, interval, TimeUnit.MINUTES);
+        System.out.println("DataCopierService running every " + interval + " minute(s).");
+    }
+
+    static void runOnce(Properties props) {
         String url = props.getProperty("db.url");
         String user = props.getProperty("db.user");
         String password = props.getProperty("db.password");
+        System.out.println("[" + Instant.now() + "] Starting data copy.");
 
         try (Connection connection = DriverManager.getConnection(url, user, password)) {
             connection.setAutoCommit(false);
 
-            // Pre-load the keyword map from the entity_keywords table
+            // Reload every run: entities and keywords are added (e.g. "Add to platform") while running.
+            KEYWORD_TO_IDS_MAP.clear();
             loadEntityKeywords(connection);
             System.out.println("Loaded " + KEYWORD_TO_IDS_MAP.size() + " entity keywords.");
 
@@ -41,7 +76,7 @@ public class App {
             transferData(connection, "youtube_comments", "YouTube", "id", "text", "published_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
             transferData(connection, "reddit_posts", "Reddit", "id", "text", "created_at", "author", "sentiment_score", "keyword", "permalink", "sentiment_category");
 
-            System.out.println("Data consolidation complete.");
+            System.out.println("[" + Instant.now() + "] Data consolidation complete.");
 
         } catch (SQLException e) {
             e.printStackTrace();
